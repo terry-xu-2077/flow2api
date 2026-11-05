@@ -1568,8 +1568,8 @@ class GenerationHandler:
         return token_obj is not None
 
     # ========== 参考图复用缓存 ==========
-    # 同一张图（内容哈希）在同一账号、同一项目、同一比例下只上传一次。不按时间过期：
-    # 复用前先向 Flow 查询这个媒体是否还在项目里，查不到（被删除等）才重新上传。
+    # 同一张图（内容哈希）在同一账号、同一项目下只上传一次，直接复用已上传的 media_id，
+    # 不再向 Flow 确认（参考图一般不会被人从项目里删掉）。
 
     def _load_ref_cache(self) -> Dict[str, Dict[str, Any]]:
         try:
@@ -1587,25 +1587,6 @@ class GenerationHandler:
         except Exception as e:
             debug_logger.log_warning(f"[REF-CACHE] 保存失败: {e}")
 
-    async def _reference_media_alive(self, token, media_id: str, project_id: str) -> bool:
-        """向 Flow 查询媒体是否仍存在于项目中（能取到媒体地址即视为存在）。"""
-        try:
-            media = await self.flow_client.get_media(
-                token.at,
-                media_id,
-                google_cookies=getattr(token, "google_cookies", None),
-                token_id=token.id,
-                project_id=project_id,
-            )
-        except Exception as e:
-            debug_logger.log_info(f"[REF-CACHE] 查询媒体 {media_id} 失败，视为失效: {e}")
-            return False
-        if not isinstance(media, dict):
-            return False
-        url = ((media.get("image") or {}).get("generatedImage") or {}).get("fifeUrl") \
-            or ((media.get("video") or {}).get("fifeUrl"))
-        return bool(str(url or "").strip())
-
     async def _upload_reference_image(self, token, image_bytes: bytes, aspect_ratio: str, project_id: str) -> str:
         """上传参考图；内容相同、且 Flow 项目里仍存在的图片直接复用已上传的 media_id。"""
         digest = hashlib.sha256(image_bytes).hexdigest()
@@ -1621,15 +1602,8 @@ class GenerationHandler:
                                              key: str, digest: str) -> str:
         hit = self._ref_cache.get(key)
         if hit and hit.get("media_id"):
-            if time.time() - float(hit.get("at") or 0) < 120:
-                # 刚上传/刚确认过（例如并发请求里前一个刚传完），不必再查一次
-                return hit["media_id"]
-            if await self._reference_media_alive(token, hit["media_id"], project_id):
-                debug_logger.log_info(f"[REF-CACHE] 复用参考图 {digest[:12]} -> {hit['media_id']}")
-                hit["at"] = time.time()
-                return hit["media_id"]
-            debug_logger.log_info(f"[REF-CACHE] 参考图 {hit['media_id']} 已不在项目中，重新上传")
-            self._ref_cache.pop(key, None)
+            debug_logger.log_info(f"[REF-CACHE] 复用参考图 {digest[:12]} -> {hit['media_id']}")
+            return hit["media_id"]
         media_id = await self.flow_client.upload_image(
             token.at,
             image_bytes,
