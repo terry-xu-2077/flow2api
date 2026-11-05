@@ -3,9 +3,11 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import base64
+import hashlib
 import json
 import mimetypes
 import re
+from pathlib import Path
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
@@ -18,7 +20,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ..core.auth import AuthManager, verify_api_key_flexible
 from ..core.logger import debug_logger
@@ -233,9 +235,26 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
     return None
 
 
+UPLOAD_DIR = Path(__file__).resolve().parents[2] / "data" / "uploads"
+UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+
+
+def _upload_path(upload_id: str) -> Path:
+    if not UPLOAD_ID_RE.match(upload_id):
+        raise HTTPException(status_code=400, detail=f"Invalid upload id: {upload_id}")
+    return UPLOAD_DIR / upload_id
+
+
 async def _load_image_bytes_from_uri(uri: str) -> bytes:
     if not uri:
         raise HTTPException(status_code=400, detail="Image URI cannot be empty")
+
+    if uri.startswith("ref://"):
+        path = _upload_path(uri[len("ref://"):])
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"Uploaded image not found: {uri}")
+        return path.read_bytes()
 
     if uri.startswith("data:image"):
         _, image_bytes = _decode_data_url(uri)
@@ -833,6 +852,35 @@ async def list_models(api_key: str = Depends(verify_api_key_flexible)):
     ]
 
     return {"object": "list", "data": models}
+
+
+@router.post("/v1/media/upload")
+async def upload_media(request: Request, api_key: str = Depends(verify_api_key_flexible)):
+    """Store a reference image (raw request body) and return its id; use it as image_url "ref://<id>"."""
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty upload")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Upload too large")
+    if _detect_image_mime_type(data, "") == "":
+        raise HTTPException(status_code=400, detail="Unsupported image format")
+    upload_id = hashlib.sha256(data).hexdigest()
+    path = UPLOAD_DIR / upload_id
+    existed = path.is_file()
+    if not existed:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+    return {"id": upload_id, "uri": f"ref://{upload_id}", "size": len(data), "existed": existed}
+
+
+@router.head("/v1/media/{upload_id}")
+async def head_media(upload_id: str, api_key: str = Depends(verify_api_key_flexible)):
+    """200 if the uploaded image is still stored, 404 otherwise."""
+    if not _upload_path(upload_id).is_file():
+        raise HTTPException(status_code=404, detail="Uploaded image not found")
+    return Response(status_code=200)
 
 
 @router.get("/v1/models/aliases")

@@ -1290,6 +1290,34 @@ class TokenManager:
         except Exception as e:
             debug_logger.log_warning(f"[PROTOCOL_REFRESH] 停止后台任务时出错: {e}")
 
+    def _fixed_project_name(self) -> str:
+        """setting.toml [flow] fixed_project_name：设置后所有生成固定使用这个名字的项目（不再轮换项目池）。"""
+        try:
+            return str((config._config.get("flow") or {}).get("fixed_project_name") or "").strip()
+        except Exception:
+            return ""
+
+    async def _ensure_fixed_project(self, token: Token, name: str) -> str:
+        """找到（或在 Flow 里新建）指定名字的项目，并设为该 Token 的当前项目。"""
+        projects = [p for p in await self.db.get_projects_by_token(token.id) if p.is_active]
+        project = next((p for p in projects if p.project_name == name), None)
+        if project is None:
+            project_id = await self.flow_client.create_project(
+                token.st,
+                name,
+                google_cookies=token.google_cookies,
+            )
+            project = Project(project_id=project_id, token_id=token.id, project_name=name)
+            project.id = await self.db.add_project(project)
+            debug_logger.log_info(f"[PROJECT] Created fixed project for token {token.id}: {name} ({project_id})")
+        if token.current_project_id != project.project_id:
+            await self.db.update_token(
+                token.id,
+                current_project_id=project.project_id,
+                current_project_name=project.project_name,
+            )
+        return project.project_id
+
     async def ensure_project_exists(self, token_id: int) -> str:
         """Ensure a token has a pooled set of projects and return one in round-robin order."""
         project_lock = await self._get_token_lock(
@@ -1301,6 +1329,13 @@ class TokenManager:
             token = await self.db.get_token(token_id)
             if not token:
                 raise ValueError("Token not found")
+
+            fixed_name = self._fixed_project_name()
+            if fixed_name:
+                try:
+                    return await self._ensure_fixed_project(token, fixed_name)
+                except Exception as e:
+                    raise ValueError(f"Failed to prepare fixed project {fixed_name}: {str(e)}")
 
             projects = [
                 project

@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import math
 import time
@@ -1393,6 +1394,9 @@ class GenerationHandler:
         proxy_manager,
     ):
         cache_dir = Path(__file__).resolve().parents[2] / "tmp"
+        # 参考图复用：同一张图（内容哈希）在同一账号、同一项目、同一比例下只上传一次
+        self._ref_cache_path = Path(__file__).resolve().parents[2] / "data" / "reference_media_cache.json"
+        self._ref_cache: Dict[str, Dict[str, Any]] = self._load_ref_cache()
         self.flow_client = flow_client
         self.token_manager = token_manager
         self.load_balancer = load_balancer
@@ -1562,6 +1566,82 @@ class GenerationHandler:
             for_image_generation=is_image, for_video_generation=is_video
         )
         return token_obj is not None
+
+    # ========== 参考图复用缓存 ==========
+    # 同一张图（内容哈希）在同一账号、同一项目、同一比例下只上传一次。不按时间过期：
+    # 复用前先向 Flow 查询这个媒体是否还在项目里，查不到（被删除等）才重新上传。
+
+    def _load_ref_cache(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            data = json.loads(self._ref_cache_path.read_text(encoding="utf-8"))
+            return {k: v for k, v in data.items() if isinstance(v, dict) and v.get("media_id")}
+        except Exception:
+            return {}
+
+    def _save_ref_cache(self):
+        try:
+            self._ref_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._ref_cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._ref_cache), encoding="utf-8")
+            tmp.replace(self._ref_cache_path)
+        except Exception as e:
+            debug_logger.log_warning(f"[REF-CACHE] 保存失败: {e}")
+
+    async def _reference_media_alive(self, token, media_id: str, project_id: str) -> bool:
+        """向 Flow 查询媒体是否仍存在于项目中（能取到媒体地址即视为存在）。"""
+        try:
+            media = await self.flow_client.get_media(
+                token.at,
+                media_id,
+                google_cookies=getattr(token, "google_cookies", None),
+                token_id=token.id,
+                project_id=project_id,
+            )
+        except Exception as e:
+            debug_logger.log_info(f"[REF-CACHE] 查询媒体 {media_id} 失败，视为失效: {e}")
+            return False
+        if not isinstance(media, dict):
+            return False
+        url = ((media.get("image") or {}).get("generatedImage") or {}).get("fifeUrl") \
+            or ((media.get("video") or {}).get("fifeUrl"))
+        return bool(str(url or "").strip())
+
+    async def _upload_reference_image(self, token, image_bytes: bytes, aspect_ratio: str, project_id: str) -> str:
+        """上传参考图；内容相同、且 Flow 项目里仍存在的图片直接复用已上传的 media_id。"""
+        digest = hashlib.sha256(image_bytes).hexdigest()
+        # 缓存不区分比例/分辨率：同一张图在同一项目里只传一次
+        key = f"{token.id}|{project_id}|{digest}"
+        # 同一张图并发上传时只传一次：后到的请求等前一个传完，直接复用它的 media_id
+        locks = self.__dict__.setdefault("_ref_upload_locks", {})
+        lock = locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            return await self._upload_reference_image_locked(token, image_bytes, aspect_ratio, project_id, key, digest)
+
+    async def _upload_reference_image_locked(self, token, image_bytes: bytes, aspect_ratio: str, project_id: str,
+                                             key: str, digest: str) -> str:
+        hit = self._ref_cache.get(key)
+        if hit and hit.get("media_id"):
+            if time.time() - float(hit.get("at") or 0) < 120:
+                # 刚上传/刚确认过（例如并发请求里前一个刚传完），不必再查一次
+                return hit["media_id"]
+            if await self._reference_media_alive(token, hit["media_id"], project_id):
+                debug_logger.log_info(f"[REF-CACHE] 复用参考图 {digest[:12]} -> {hit['media_id']}")
+                hit["at"] = time.time()
+                return hit["media_id"]
+            debug_logger.log_info(f"[REF-CACHE] 参考图 {hit['media_id']} 已不在项目中，重新上传")
+            self._ref_cache.pop(key, None)
+        media_id = await self.flow_client.upload_image(
+            token.at,
+            image_bytes,
+            aspect_ratio,
+            project_id=project_id,
+            token_id=token.id,
+            google_cookies=getattr(token, "google_cookies", None),
+        )
+        if media_id:
+            self._ref_cache[key] = {"media_id": media_id, "at": time.time()}
+            self._save_ref_cache()
+        return media_id
 
     async def handle_generation(
         self,
@@ -2093,13 +2173,11 @@ class GenerationHandler:
 
                 # 支持多图输入
                 for idx, image_bytes in enumerate(images):
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
+                    media_id = await self._upload_reference_image(
+                        token,
                         image_bytes,
                         model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
+                        project_id,
                     )
                     image_inputs.append(
                         {
@@ -2583,13 +2661,11 @@ class GenerationHandler:
                     # 只有1张图: 仅作为首帧
                     if stream:
                         yield self._create_stream_chunk("上传首帧图片...\n")
-                    start_media_id = await self.flow_client.upload_image(
-                        token.at,
+                    start_media_id = await self._upload_reference_image(
+                        token,
                         images[0],
                         model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
+                        project_id,
                     )
                     debug_logger.log_info(f"[I2V] 仅上传首帧: {start_media_id}")
 
@@ -2597,21 +2673,17 @@ class GenerationHandler:
                     # 2张图: 首帧+尾帧
                     if stream:
                         yield self._create_stream_chunk("上传首帧和尾帧图片...\n")
-                    start_media_id = await self.flow_client.upload_image(
-                        token.at,
+                    start_media_id = await self._upload_reference_image(
+                        token,
                         images[0],
                         model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
+                        project_id,
                     )
-                    end_media_id = await self.flow_client.upload_image(
-                        token.at,
+                    end_media_id = await self._upload_reference_image(
+                        token,
                         images[1],
                         model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
+                        project_id,
                     )
                     debug_logger.log_info(
                         f"[I2V] 上传首尾帧: {start_media_id}, {end_media_id}"
@@ -2625,13 +2697,11 @@ class GenerationHandler:
                     )
 
                 for img in images:
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
+                    media_id = await self._upload_reference_image(
+                        token,
                         img,
                         model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
+                        project_id,
                     )
                     reference_images.append(
                         {
@@ -2651,13 +2721,11 @@ class GenerationHandler:
                     )
 
                 for img in images:
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
+                    media_id = await self._upload_reference_image(
+                        token,
                         img,
                         model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
+                        project_id,
                     )
                     reference_images.append(
                         {

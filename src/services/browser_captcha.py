@@ -3288,7 +3288,15 @@ class BrowserCaptchaService:
     
     _instance: Optional["BrowserCaptchaService"] = None
     _lock = asyncio.Lock()
-    QUEUE_WAIT_SECONDS = 30.0
+    @property
+    def QUEUE_WAIT_SECONDS(self) -> float:
+        """打码浏览器排队等待上限（秒）。setting.toml [captcha] browser_queue_wait_seconds，默认 600。
+        原来写死 30 秒：并发请求时后到的请求排不到浏览器就直接失败；改成一直等到前面的请求让出浏览器。"""
+        try:
+            value = (config._config.get("captcha") or {}).get("browser_queue_wait_seconds", 600)
+            return max(1.0, float(value))
+        except Exception:
+            return 600.0
     DRAIN_WAIT_SECONDS = 120.0
     RECOVERY_TIMEOUT_SECONDS = 60.0
     RECOVERY_BACKOFF_SECONDS = (5.0, 15.0, 30.0, 60.0)
@@ -4100,17 +4108,15 @@ class BrowserCaptchaService:
     ) -> tuple[Dict[str, Any], Union[int, str], Optional[Dict[str, Any]]]:
         """Reuse this request's account context and bound admission plus submission."""
         self._check_available()
-        deadline = time.monotonic() + max(1, float(timeout))
         token_proxy_url = await self._resolve_token_proxy_url(token_id)
         async with self._borrow_browser(
             project_id,
             token_id,
             browser_ref=browser_ref,
-            wait_timeout=min(
-                self.QUEUE_WAIT_SECONDS, max(0, deadline - time.monotonic())
-            ),
+            wait_timeout=self.QUEUE_WAIT_SECONDS,
         ) as request:
-            remaining = max(0.001, deadline - time.monotonic())
+            # 排队时间不占用提交超时：排到浏览器后再给完整的 timeout
+            remaining = max(1.0, float(timeout))
             try:
                 response = await asyncio.wait_for(
                     request.browser.submit_flow_request(
