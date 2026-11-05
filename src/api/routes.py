@@ -7,6 +7,8 @@ import hashlib
 import json
 import mimetypes
 import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -852,6 +854,52 @@ async def list_models(api_key: str = Depends(verify_api_key_flexible)):
     ]
 
     return {"object": "list", "data": models}
+
+
+PRO_IMAGE_MODEL = "GEM_PIX_2"  # Nano Banana Pro；其余图片模型（2.1 / 2 Lite）合计一个额度
+# Flow 每日图片限额 (Pro, 其余合计)；Plus 与 Pro 订阅相同，Ultra（PAYGATE_TIER_TWO）更高
+IMAGE_DAILY_LIMITS = {"PAYGATE_TIER_TWO": (500, 1000)}
+DEFAULT_IMAGE_DAILY_LIMITS = (100, 1000)
+CREDITS_REFRESH_SECONDS = 60
+_credits_refreshed_at: Dict[int, float] = {}
+
+
+@router.get("/v1/usage")
+async def get_usage(api_key: str = Depends(verify_api_key_flexible)):
+    """Flow 积分和今日图片用量。用量按本服务完成的图片请求统计（服务器本地日期），Flow 官网上直接生成的不计入。"""
+    handler = _ensure_generation_handler()
+    tokens = [t for t in await handler.db.get_all_tokens_with_stats() if t.get("is_active")]
+    midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    since = midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    used: Dict[int, Dict[str, int]] = {}
+    for token_id, model in await handler.db.get_completed_image_models_since(since):
+        model_name = (MODEL_CONFIG.get(model) or {}).get("model_name")
+        bucket = "pro" if model_name == PRO_IMAGE_MODEL else "other"
+        counts = used.setdefault(token_id, {"pro": 0, "other": 0})
+        counts[bucket] += 1
+
+    credits = 0
+    totals = {"pro": [0, 0], "other": [0, 0]}  # [used, limit]
+    for token in tokens:
+        if time.time() - _credits_refreshed_at.get(token["id"], 0) > CREDITS_REFRESH_SECONDS:
+            _credits_refreshed_at[token["id"]] = time.time()
+            try:
+                token["credits"] = await handler.token_manager.refresh_credits(token["id"])
+            except Exception as exc:  # 刷新失败就用库里已有的值
+                debug_logger.log_warning(f"[USAGE] 刷新积分失败: token_id={token['id']}, {exc}")
+        credits += int(token.get("credits") or 0)
+        pro_limit, other_limit = IMAGE_DAILY_LIMITS.get(token.get("user_paygate_tier"), DEFAULT_IMAGE_DAILY_LIMITS)
+        counts = used.get(token["id"], {"pro": 0, "other": 0})
+        totals["pro"][0] += counts["pro"]; totals["pro"][1] += pro_limit
+        totals["other"][0] += counts["other"]; totals["other"][1] += other_limit
+    return {
+        "date": datetime.now().date().isoformat(),
+        "credits": credits,
+        "image_daily": [
+            {"key": "pro", "name": "Nano Banana Pro", "used": totals["pro"][0], "limit": totals["pro"][1]},
+            {"key": "other", "name": "Nano Banana 2.1 / 2 Lite", "used": totals["other"][0], "limit": totals["other"][1]},
+        ],
+    }
 
 
 @router.post("/v1/media/upload")

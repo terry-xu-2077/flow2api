@@ -3,6 +3,7 @@
 import asyncio
 import aiosqlite
 import json
+import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Optional, List, Dict, Any
@@ -1868,6 +1869,22 @@ class Database:
             )
             await db.commit()
             return cursor.lastrowid
+
+    async def get_completed_image_models_since(self, since: str) -> List[tuple]:
+        """(token_id, model) of every completed image request created at or after `since` (UTC)."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT token_id, request_body FROM request_logs "
+                "WHERE operation = 'generate_image' AND status_text = 'completed' AND created_at >= ?",
+                (since,),
+            )
+            rows = await cursor.fetchall()
+        result = []
+        for token_id, body in rows:
+            match = re.search(r'"model": "([^"]+)"', body or "")
+            if match:
+                result.append((token_id, match.group(1)))
+        return result
 
     async def get_recent_request_durations(
         self, operation: str, model: Optional[str] = None, limit: int = 10
