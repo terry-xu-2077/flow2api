@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import math
+import statistics
 import time
 from pathlib import Path
 from typing import Optional, AsyncGenerator, List, Dict, Any
@@ -1617,6 +1618,34 @@ class GenerationHandler:
             self._save_ref_cache()
         return media_id
 
+    # ========== 估算进度 ==========
+    # Flow 的生成请求是一次阻塞调用，拿不到真实进度；按同一模型最近 10 次成功请求耗时的中位数估算。
+
+    async def _estimate_duration(self, model: str, operation: str) -> float:
+        durations = await self.db.get_recent_request_durations(operation, model)
+        if len(durations) < 3:
+            durations = await self.db.get_recent_request_durations(operation)
+        if len(durations) >= 3:
+            return statistics.median(durations)
+        return 60.0 if operation == "generate_image" else 150.0
+
+    @staticmethod
+    def _estimated_percent(state: Dict[str, Any]) -> int:
+        """前 90% 的时间匀速走到 90%，之后放慢逼近 99%，完成前不会到 100%。"""
+        f = (time.time() - state["started_at"]) / max(state["expected"], 1.0)
+        if f <= 0.9:
+            return int(f * 100)
+        return min(99, int(90 + 9 * (1 - math.exp(-(f - 0.9) / 0.3))))
+
+    async def _progress_chunks(self, task, request_log_state: Dict[str, Any], stream: bool):
+        """等待 task 期间，流式请求每秒推送一次估算进度。"""
+        while stream and not task.done():
+            await asyncio.wait({task}, timeout=1.0)
+            if not task.done():
+                yield self._create_stream_chunk(
+                    f"生成进度: 约 {self._estimated_percent(request_log_state)}%\n"
+                )
+
     async def handle_generation(
         self,
         model: str,
@@ -1670,6 +1699,10 @@ class GenerationHandler:
             "extend_video"
             if video_type_for_op == "extend"
             else f"generate_{generation_type}"
+        )
+        request_log_state["started_at"] = start_time
+        request_log_state["expected"] = await self._estimate_duration(
+            model, request_operation
         )
         prompt_for_log = (
             prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
@@ -2188,22 +2221,33 @@ class GenerationHandler:
                 )
 
             generate_started_at = time.time()
-            (
-                result,
-                generation_session_id,
-                upstream_trace,
-            ) = await self.flow_client.generate_image(
-                at=token.at,
-                project_id=project_id,
-                prompt=prompt,
-                model_name=model_config["model_name"],
-                aspect_ratio=model_config["aspect_ratio"],
-                image_inputs=image_inputs,
-                token_id=token.id,
-                token_image_concurrency=token.image_concurrency,
-                progress_callback=_image_progress_callback,
-                google_cookies=getattr(token, "google_cookies", None),
+            generate_task = asyncio.ensure_future(
+                self.flow_client.generate_image(
+                    at=token.at,
+                    project_id=project_id,
+                    prompt=prompt,
+                    model_name=model_config["model_name"],
+                    aspect_ratio=model_config["aspect_ratio"],
+                    image_inputs=image_inputs,
+                    token_id=token.id,
+                    token_image_concurrency=token.image_concurrency,
+                    progress_callback=_image_progress_callback,
+                    google_cookies=getattr(token, "google_cookies", None),
+                )
             )
+            try:
+                async for chunk in self._progress_chunks(
+                    generate_task, request_log_state, stream
+                ):
+                    yield chunk
+                (
+                    result,
+                    generation_session_id,
+                    upstream_trace,
+                ) = await generate_task
+            finally:
+                if not generate_task.done():
+                    generate_task.cancel()
             if image_trace is not None:
                 image_trace["generate_api_ms"] = int(
                     (time.time() - generate_started_at) * 1000
@@ -3028,10 +3072,9 @@ class GenerationHandler:
                 operation = checked_operations[0]
                 status = operation.get("status")
 
-                # 状态更新 - 每20秒报告一次 (poll_interval=3秒, 20秒约7次轮询)
-                progress_update_interval = 7  # 每7次轮询 = 21秒
-                if stream and attempt % progress_update_interval == 0:  # 每20秒报告一次
-                    progress = min(int((attempt / max_attempts) * 100), 95)
+                # 状态更新 - 每次轮询报告一次估算进度
+                if stream:
+                    progress = self._estimated_percent(request_log_state)
                     await self._update_request_log_progress(
                         request_log_state,
                         token_id=token.id,
@@ -3039,7 +3082,7 @@ class GenerationHandler:
                         progress=max(45, progress),
                         response_extra={"upstream_status": status},
                     )
-                    yield self._create_stream_chunk(f"生成进度: {progress}%\n")
+                    yield self._create_stream_chunk(f"生成进度: 约 {progress}%\n")
 
                 # 检查状态
                 if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":

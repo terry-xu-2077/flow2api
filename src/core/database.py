@@ -1869,6 +1869,24 @@ class Database:
             await db.commit()
             return cursor.lastrowid
 
+    async def get_recent_request_durations(
+        self, operation: str, model: Optional[str] = None, limit: int = 10
+    ) -> List[float]:
+        """Durations (seconds) of the latest completed requests, optionally for one model."""
+        sql = (
+            "SELECT duration FROM request_logs "
+            "WHERE operation = ? AND status_text = 'completed' AND duration > 0"
+        )
+        params: List[Any] = [operation]
+        if model:
+            sql += " AND request_body LIKE ?"
+            params.append(f'%"model": "{model}"%')
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        async with self._connect() as db:
+            cursor = await db.execute(sql, params)
+            return [float(row[0]) for row in await cursor.fetchall()]
+
     async def update_request_log(self, log_id: int, **kwargs):
         """Update an existing request log row."""
         if not kwargs:
