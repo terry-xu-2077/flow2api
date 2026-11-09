@@ -59,87 +59,135 @@ TRUSTED_RECAPTCHA_HOOK_SOURCE = r"""
 })();
 """
 
+# Execution strategy (in order; the hook is only waited for as a last resort):
+#   1. `grecaptcha.enterprise.execute.call(enterprise, siteKey, {action})`
+#      (newer Flow builds no longer call `.bind()`, so nothing gets captured;
+#      this is the documented enterprise-v3 usage and works without a render),
+#   2. render into a *fresh empty* container and execute the widget id. The old
+#      code rendered into `document.documentElement`, which always contains
+#      children and makes reCAPTCHA throw
+#      "reCAPTCHA placeholder element must be empty",
+#   3. the pre-hijack `enterprise.execute` closure captured by the bind hook
+#      (older Flow builds), after waiting up to 10s for it.
 RECAPTCHA_EXECUTE_SOURCE = r"""(async (siteKey, requestedAction, timeoutMs) => {
             const storageKey = '__flow2apiTrustedRecaptchaExecute';
-            const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-            const runExecute = (execute, target) => new Promise((resolve, reject) => {
-                let settled = false;
-                const finish = (handler, value) => {
-                    if (settled) return;
-                    settled = true;
-                    handler(value);
-                };
-                const timer = setTimeout(() => {
-                    finish(reject, new Error('execute timeout'));
-                }, timeoutMs);
-                try {
-                    Promise.resolve(execute(target, { action: requestedAction }))
-                        .then(value => {
-                            clearTimeout(timer);
-                            finish(resolve, value);
-                        })
-                        .catch(error => {
-                            clearTimeout(timer);
-                            finish(reject, error);
-                        });
-                } catch (error) {
-                    clearTimeout(timer);
-                    finish(reject, error);
-                }
-            });
-            const errText = error => (error && error.message ? error.message : String(error));
-
-            // Primary: the page's own execute called directly with the site key (no waiting).
-            // Fallback: the bound execute captured by the Function.prototype.bind hook.
             const enterprise = window.grecaptcha && window.grecaptcha.enterprise;
-            const direct = enterprise && enterprise.execute;
-            let directSource = '';
-            try { directSource = String(direct || ''); } catch (error) {}
-            const guardMissing =
-                directSource.includes('extension_hijack_detected') &&
-                !window.__flow2apiRecaptchaActionGuardInstalled;
+            let capturedExecute = !!window[storageKey];
+            const debug = {
+                hookInstalled: !!window.__flow2apiTrustedRecaptchaHookInstalled,
+                actionGuard: !!window.__flow2apiRecaptchaActionGuardInstalled,
+                captured: capturedExecute,
+                executeType: enterprise ? typeof enterprise.execute : 'missing',
+                renderType: enterprise ? typeof enterprise.render : 'missing',
+                url: location.href
+            };
+            const errors = [];
 
-            let directError = '';
-            if (typeof direct === 'function' && !guardMissing) {
+            const runExecute = async (label, factory) => {
                 try {
-                    const token = await runExecute(direct, siteKey);
-                    if (token) return { ok: true, token, via: 'direct' };
-                    directError = 'empty token';
+                    const token = await new Promise((resolve, reject) => {
+                        let settled = false;
+                        const finish = (handler, value) => {
+                            if (settled) return;
+                            settled = true;
+                            clearTimeout(timer);
+                            handler(value);
+                        };
+                        const timer = setTimeout(() => {
+                            finish(reject, new Error('execute timeout'));
+                        }, timeoutMs);
+                        try {
+                            Promise.resolve(factory()).then(
+                                value => finish(resolve, value),
+                                error => finish(reject, error)
+                            );
+                        } catch (error) {
+                            finish(reject, error);
+                        }
+                    });
+                    const normalized = typeof token === 'string' ? token.trim() : '';
+                    if (normalized) return normalized;
+                    errors.push(label + ': empty token');
                 } catch (error) {
-                    directError = errText(error);
+                    errors.push(
+                        label + ': '
+                        + (error && error.message ? error.message : String(error))
+                    );
                 }
-            } else if (guardMissing) {
-                directError = 'trusted reCAPTCHA action guard is unavailable';
-            } else {
-                directError = 'reCAPTCHA execute is unavailable';
+                return null;
+            };
+
+            if (enterprise && typeof enterprise.execute === 'function') {
+                let executeSource = '';
+                try {
+                    executeSource = String(enterprise.execute || '');
+                } catch (error) {}
+                if (
+                    executeSource.includes('extension_hijack_detected') &&
+                    !window.__flow2apiRecaptchaActionGuardInstalled
+                ) {
+                    errors.push('direct: trusted reCAPTCHA action guard is unavailable');
+                } else {
+                    const token = await runExecute('direct', () => {
+                        return enterprise.execute.call(
+                            enterprise,
+                            siteKey,
+                            { action: requestedAction }
+                        );
+                    });
+                    if (token) return { ok: true, token, debug };
+                }
+
+                if (typeof enterprise.render === 'function') {
+                    try {
+                        const container = document.createElement('div');
+                        container.setAttribute('data-flow2api-recaptcha', '1');
+                        container.style.display = 'none';
+                        (document.body || document.documentElement)
+                            .appendChild(container);
+                        const clientId = enterprise.render(
+                            container,
+                            { sitekey: siteKey, action: requestedAction }
+                        );
+                        const token = await runExecute('render', () => {
+                            return enterprise.execute.call(
+                                enterprise,
+                                clientId,
+                                { action: requestedAction }
+                            );
+                        });
+                        if (token) return { ok: true, token, debug };
+                    } catch (renderError) {
+                        errors.push(
+                            'render: '
+                            + (renderError && renderError.message
+                                ? renderError.message
+                                : String(renderError))
+                        );
+                    }
+                }
             }
 
-            for (let attempt = 0; attempt < 40; attempt += 1) {
-                if (window[storageKey]) break;
-                await sleep(250);
+            // Last resort: the bound execute captured by the bind hook (older Flow builds).
+            // Only now do we wait for the hook, so the common path never stalls.
+            for (let attempt = 0; attempt < 40 && !window[storageKey]; attempt += 1) {
+                await new Promise(resolve => setTimeout(resolve, 250));
             }
-            const captured = window[storageKey];
-            if (typeof captured !== 'function') {
-                return { ok: false, error: 'direct execute failed: ' + directError };
+            capturedExecute = !!window[storageKey];
+            debug.captured = capturedExecute;
+            if (capturedExecute && typeof window[storageKey] === 'function') {
+                const token = await runExecute('captured', () => {
+                    return window[storageKey](siteKey, { action: requestedAction });
+                });
+                if (token) return { ok: true, token, debug };
             }
-            let target = siteKey;
-            if (window.__flow2apiRecaptchaClientId !== undefined) {
-                target = window.__flow2apiRecaptchaClientId;
-            }
-            try {
-                const token = await runExecute(captured, target);
-                return { ok: true, token, via: 'captured' };
-            } catch (error) {
-                return {
-                    ok: false,
-                    error: errText(error) + ' | direct: ' + directError
-                        + ' | ' + JSON.stringify({
-                            actionGuard: !!window.__flow2apiRecaptchaActionGuardInstalled,
-                            url: location.href
-                        })
-                };
-            }
+
+            return {
+                ok: false,
+                error: errors.join(' | ') || 'reCAPTCHA execute is unavailable',
+                debug
+            };
         })(__SITE_KEY__, __REQUESTED_ACTION__, __TIMEOUT_MS__)"""
 
 
