@@ -2211,7 +2211,7 @@ class TokenBrowser:
                 )
                 if isinstance(result, dict) and result.get("ok"):
                     return str(result.get("token") or "").strip() or None
-                reason = str(result.get("error") or "empty token")[:240] if isinstance(result, dict) else "invalid result"
+                reason = str(result.get("error") or "empty token")[:1500] if isinstance(result, dict) else "invalid result"
                 debug_logger.log_warning(f"[BrowserCaptcha] reCAPTCHA execute 未返回有效 token: {reason}")
                 return None
 
