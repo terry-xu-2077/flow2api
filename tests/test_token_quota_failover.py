@@ -54,6 +54,8 @@ def _build_handler(tokens, quota_token_ids, error=QUOTA_ERROR, errors_by_token=N
     handler = GenerationHandler.__new__(GenerationHandler)
     handler.token_manager = token_manager
     handler.load_balancer = load_balancer
+    handler.db = MagicMock()
+    handler.db.get_recent_request_durations = AsyncMock(return_value=[])
     handler.flow_client = MagicMock()
     handler.flow_client.prefill_remote_browser_pool = AsyncMock()
     handler._log_request = AsyncMock(return_value=1)
