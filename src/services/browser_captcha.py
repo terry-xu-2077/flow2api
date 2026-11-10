@@ -494,9 +494,11 @@ class TokenBrowser:
         self.token_id = token_id
         self.user_data_dir = user_data_dir
         self.db = db
-        self._semaphore = asyncio.Semaphore(
-            1
-        )  # Only one active solve task is allowed per slot.
+        # One active solve task per slot by default; browser_slot_concurrency > 1 lets
+        # several requests share a slot (they reuse one warm Flow page, see _get_warm_page).
+        self._semaphore = asyncio.Semaphore(config.browser_slot_concurrency)
+        self._warm_pages: Dict[str, Dict[str, Any]] = {}
+        self._warm_page_locks: Dict[str, asyncio.Lock] = {}
         self._solve_count = 0
         self._error_count = 0
         self._last_fingerprint: Optional[Dict[str, Any]] = None
@@ -1672,6 +1674,7 @@ class TokenBrowser:
         self._shared_proxy_url = None
         self._shared_bound_token_id = None
         self._shared_bound_cookie_signature = None
+        self._warm_pages = {}
         self._runtime_generation = getattr(self, "_runtime_generation", 0) + 1
         self._last_fingerprint = None
         self._last_harvest_session_id = None
@@ -2182,6 +2185,13 @@ class TokenBrowser:
             f"[BrowserCaptcha] Token-{self.token_id} harvest 开始: "
             f"project={project_id} action={action}"
         )
+        if (
+            normalized_action != "CHAT_GENERATION"
+            and config.browser_slot_concurrency > 1
+        ):
+            return await self._execute_captcha_on_warm_page(
+                context, project_id, website_key, action, normalized_action
+            )
         try:
             page = await context.new_page()
             await self._apply_browser_environment_patch(page, label="captcha_page")
@@ -2235,6 +2245,120 @@ class TokenBrowser:
                     await page.close()
                 except:
                     pass
+
+    WARM_PAGE_MAX_AGE_SECONDS = 600.0
+
+    async def _close_warm_page(self, key: str, entry: Optional[Dict[str, Any]] = None):
+        current = self._warm_pages.get(key)
+        if entry is None:
+            entry = current
+        if current is entry:
+            self._warm_pages.pop(key, None)
+        page = (entry or {}).get("page")
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    async def _get_warm_page(self, context, project_id: str, website_key: str, action: str):
+        """Return a ready Flow page for this project, opening it only once.
+
+        The Flow site itself keeps its page open and just calls grecaptcha.execute for every
+        generation (~0.4s). Opening and warming a fresh page for each token costs ~20s and
+        serialises concurrent generations, so concurrent requests share one warm page.
+        """
+        key = str(project_id)
+        lock = self._warm_page_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            entry = self._warm_pages.get(key)
+            if entry is not None:
+                page = entry.get("page")
+                fresh = (
+                    entry.get("generation") == self._runtime_generation
+                    and (time.monotonic() - entry.get("ready_at", 0))
+                    < self.WARM_PAGE_MAX_AGE_SECONDS
+                )
+                closed = True
+                try:
+                    closed = bool(page is None or page.is_closed())
+                except Exception:
+                    closed = True
+                if fresh and not closed:
+                    return entry
+                await self._close_warm_page(key, entry)
+
+            page = await context.new_page()
+            try:
+                await self._apply_browser_environment_patch(page, label="captcha_page")
+                await page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                )
+                await page.add_init_script(TRUSTED_RECAPTCHA_HOOK_SOURCE)
+                ready = await self._prepare_flow_runtime_page(
+                    page, project_id, website_key, action, context_label="打码"
+                )
+            except BaseException:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                raise
+            if not ready:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] Token-{self.token_id} harvest 页面未就绪: "
+                    f"url={page.url[:80]}"
+                )
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                return None
+            entry = {
+                "page": page,
+                "generation": self._runtime_generation,
+                "ready_at": time.monotonic(),
+            }
+            self._warm_pages[key] = entry
+            return entry
+
+    async def _execute_captcha_on_warm_page(
+        self, context, project_id: str, website_key: str, action: str, normalized_action: str
+    ) -> Optional[str]:
+        self._harvest_streamchat_post = None
+        self._last_harvest_session_id = None
+        key = str(project_id)
+        entry = None
+        try:
+            entry = await self._get_warm_page(context, project_id, website_key, action)
+            if not entry:
+                return None
+            result = await asyncio.wait_for(
+                entry["page"].evaluate(
+                    build_recaptcha_execute_script(website_key, normalized_action, 25000)
+                ),
+                timeout=40,
+            )
+            if isinstance(result, dict) and result.get("ok"):
+                token = str(result.get("token") or "").strip()
+                if token:
+                    return token
+            reason = (
+                str(result.get("error") or "empty token")[:1500]
+                if isinstance(result, dict)
+                else "invalid result"
+            )
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] reCAPTCHA execute 未返回有效 token: {reason}"
+            )
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} 打码失败: "
+                f"{type(e).__name__}: {str(e)[:200]}"
+            )
+        # Do not keep a page that just failed; the next attempt reopens it.
+        await self._close_warm_page(key, entry)
+        return None
 
     HARVEST_PROMPT_POOL = (
         "a red apple on a wooden table",
@@ -3096,7 +3220,10 @@ class TokenBrowser:
                         debug_logger.log_warning(
                             f"[BrowserCaptcha] Token-{self.token_id} token attempt {attempt + 1}/{max_retries} failed"
                         )
-                        if self._consecutive_browser_failures >= 2:
+                        if (
+                            self._consecutive_browser_failures >= 2
+                            and self._solve_inflight <= 1
+                        ):
                             await self.recycle_browser(
                                 reason=f"captcha_failed_{attempt + 1}",
                                 rotate_profile=False,
@@ -3605,6 +3732,16 @@ class BrowserCaptchaService:
         state = self._slot_recovery.get(slot_id)
         if state and state.phase not in {"ready", "probe"}:
             return True
+        capacity = max(1, int(config.browser_slot_concurrency))
+        if capacity > 1:
+            # A request is counted once: while borrowed it holds a reservation, afterwards
+            # (submission lease) it only lives in self._requests.
+            held = sum(
+                1
+                for request in self._requests.values()
+                if request.slot_id == slot_id and request.borrower is None
+            )
+            return self._slot_reservations.get(slot_id, 0) + held >= capacity
         if any(request.slot_id == slot_id for request in self._requests.values()):
             return True
         if self._slot_reservations.get(slot_id, 0) > 0:

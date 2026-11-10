@@ -449,6 +449,15 @@ class Config:
         self._config["captcha"]["browser_count"] = max(1, min(20, int(value)))
 
     @property
+    def browser_slot_concurrency(self) -> int:
+        """单个打码浏览器同时服务的请求数；>1 时同时启用常驻页面复用。默认 1 保持原行为。"""
+        value = self._config.get("captcha", {}).get("browser_slot_concurrency", 1)
+        try:
+            return max(1, min(8, int(value)))
+        except Exception:
+            return 1
+
+    @property
     def browser_recaptcha_settle_seconds(self) -> float:
         """自定义站点分数测试在 reload/clr 就绪后的额外等待秒数。"""
         value = self._config.get("captcha", {}).get(
