@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, AsyncGenerator, List, Dict, Any
 from ..core.logger import debug_logger
 from ..core.config import config
+from .generation_gate import GateRejected, GenerationGate
 from ..core.monitoring import record_generation_result
 from ..core.models import Task, RequestLog
 from ..core.account_tiers import (
@@ -1714,7 +1715,94 @@ class GenerationHandler:
                     f"生成进度: 约 {self._estimated_percent(request_log_state)}%\n"
                 )
 
+    def _get_image_gate(self) -> GenerationGate:
+        gate = getattr(self, "_image_gate", None)
+        if gate is None:
+            gate = GenerationGate(
+                limit=lambda: config.image_max_concurrency,
+                mode=lambda: config.image_queue_mode,
+                max_wait=lambda: config.image_queue_max_wait_seconds,
+                max_queue=lambda: config.image_queue_max_length,
+            )
+            self._image_gate = gate
+        return gate
+
     async def handle_generation(
+        self,
+        model: str,
+        prompt: str,
+        images: Optional[List[bytes]] = None,
+        stream: bool = False,
+        base_url_override: Optional[str] = None,
+        video_media_id: Optional[str] = None,
+    ) -> AsyncGenerator:
+        """统一生成入口：图片生成先过全局并发闸门，再进入实际生成流程。"""
+        model_config = MODEL_CONFIG.get(model) or {}
+        if model_config.get("type") != "image" or config.image_max_concurrency <= 0:
+            async for chunk in self._handle_generation_inner(
+                model, prompt, images, stream, base_url_override, video_media_id
+            ):
+                yield chunk
+            return
+
+        gate = self._get_image_gate()
+        queue_notices: List[str] = []
+
+        def on_wait(position: int, active: int):
+            queue_notices.append(
+                f"⏳ 排队中：当前 {active} 个图片任务正在生成，您排在第 {position} 位...\n"
+            )
+
+        acquire_task = asyncio.ensure_future(gate.acquire(on_wait=on_wait))
+        held = False
+        try:
+            sent_role = False
+            while not acquire_task.done():
+                await asyncio.wait({acquire_task}, timeout=0.5)
+                while queue_notices:
+                    notice = queue_notices.pop(0)
+                    if stream:
+                        yield self._create_stream_chunk(
+                            notice, role=None if sent_role else "assistant"
+                        )
+                        sent_role = True
+            try:
+                held = bool(acquire_task.result())
+            except GateRejected as rejected:
+                reason = {
+                    "busy": "服务繁忙：图片生成并发已满，请稍后再试",
+                    "queue_full": "服务繁忙：排队人数已满，请稍后再试",
+                    "wait_timeout": "服务繁忙：排队等待超时，请稍后再试",
+                }.get(rejected.reason, "服务繁忙，请稍后再试")
+                debug_logger.log_warning(
+                    f"[GATE] 拒绝图片请求 reason={rejected.reason} "
+                    f"active={rejected.active} waiting={rejected.waiting}"
+                )
+                yield json.dumps(
+                    {
+                        "error": {
+                            "message": reason,
+                            "type": "rate_limit_error",
+                            "code": "server_busy",
+                            "status_code": 429,
+                        }
+                    },
+                    ensure_ascii=False,
+                )
+                return
+            async for chunk in self._handle_generation_inner(
+                model, prompt, images, stream, base_url_override, video_media_id
+            ):
+                yield chunk
+        finally:
+            if not acquire_task.done():
+                acquire_task.cancel()
+            elif not held and not acquire_task.cancelled() and acquire_task.exception() is None:
+                held = bool(acquire_task.result())
+            if held:
+                gate.release()
+
+    async def _handle_generation_inner(
         self,
         model: str,
         prompt: str,

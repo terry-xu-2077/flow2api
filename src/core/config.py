@@ -448,6 +448,39 @@ class Config:
             self._config["captcha"] = {}
         self._config["captcha"]["browser_count"] = max(1, min(20, int(value)))
 
+    def _generation_section(self) -> dict:
+        return self._config.get("generation", {}) or {}
+
+    @property
+    def image_max_concurrency(self) -> int:
+        """同时进行的图片生成上限（全局）；0 表示不限制。"""
+        try:
+            return max(0, min(64, int(self._generation_section().get("image_max_concurrency", 0))))
+        except Exception:
+            return 0
+
+    @property
+    def image_queue_mode(self) -> str:
+        """超过上限后的处理：queue=排队等待，reject=立即拒绝(HTTP 429)。"""
+        value = str(self._generation_section().get("image_queue_mode", "queue")).strip().lower()
+        return value if value in {"queue", "reject"} else "queue"
+
+    @property
+    def image_queue_max_wait_seconds(self) -> float:
+        """排队模式下单个请求最长等待秒数，超时按繁忙拒绝。"""
+        try:
+            return max(1.0, float(self._generation_section().get("image_queue_max_wait_seconds", 600)))
+        except Exception:
+            return 600.0
+
+    @property
+    def image_queue_max_length(self) -> int:
+        """排队模式下最多允许多少个请求排队；0 表示不限，超出立即拒绝。"""
+        try:
+            return max(0, int(self._generation_section().get("image_queue_max_length", 0)))
+        except Exception:
+            return 0
+
     @property
     def browser_slot_concurrency(self) -> int:
         """单个打码浏览器同时服务的请求数；>1 时同时启用常驻页面复用。默认 1 保持原行为。"""
