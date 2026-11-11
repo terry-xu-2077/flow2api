@@ -12,6 +12,7 @@ from typing import Optional, AsyncGenerator, List, Dict, Any
 from ..core.logger import debug_logger
 from ..core.config import config
 from .generation_gate import GateRejected, GenerationGate
+from .status_codes import status_payload
 from ..core.monitoring import record_generation_result
 from ..core.models import Task, RequestLog
 from ..core.account_tiers import (
@@ -2895,7 +2896,10 @@ class GenerationHandler:
                 if max_images is not None and image_count > max_images:
                     error_msg = f"Omni 模型最多支持 {max_images} 张参考图，当前提供了 {image_count} 张"
                     if stream:
-                        yield self._create_stream_chunk(f"{error_msg}\n")
+                        yield self._create_stream_chunk(
+                            f"{error_msg}\n",
+                            status={"code": "error", "params": {"message": str(error_msg)}},
+                        )
                     self._mark_generation_failed(generation_result, error_msg)
                     yield self._create_error_response(error_msg, status_code=400)
                     return
@@ -2905,7 +2909,10 @@ class GenerationHandler:
                 if image_count < min_images or image_count > max_images:
                     error_msg = f"首尾帧模型需要 {min_images}-{max_images} 张图片，当前提供了 {image_count} 张"
                     if stream:
-                        yield self._create_stream_chunk(f"{error_msg}\n")
+                        yield self._create_stream_chunk(
+                            f"{error_msg}\n",
+                            status={"code": "error", "params": {"message": str(error_msg)}},
+                        )
                     self._mark_generation_failed(generation_result, error_msg)
                     yield self._create_error_response(error_msg, status_code=400)
                     return
@@ -2915,7 +2922,10 @@ class GenerationHandler:
                 if max_images is not None and image_count > max_images:
                     error_msg = f"多图视频模型最多支持 {max_images} 张参考图，当前提供了 {image_count} 张"
                     if stream:
-                        yield self._create_stream_chunk(f"{error_msg}\n")
+                        yield self._create_stream_chunk(
+                            f"{error_msg}\n",
+                            status={"code": "error", "params": {"message": str(error_msg)}},
+                        )
                     self._mark_generation_failed(generation_result, error_msg)
                     yield self._create_error_response(error_msg, status_code=400)
                     return
@@ -3091,7 +3101,10 @@ class GenerationHandler:
                 if not video_media_id:
                     error_msg = "视频续写需要提供源视频的 mediaGenerationId，请在 image_url 中传入 extend://VIDEO_MEDIA_ID"
                     if stream:
-                        yield self._create_stream_chunk(f"{error_msg}\n")
+                        yield self._create_stream_chunk(
+                            f"{error_msg}\n",
+                            status={"code": "error", "params": {"message": str(error_msg)}},
+                        )
                     self._mark_generation_failed(generation_result, error_msg)
                     yield self._create_error_response(error_msg, status_code=400)
                     return
@@ -3615,7 +3628,7 @@ class GenerationHandler:
     # ========== 响应格式化 ==========
 
     def _create_stream_chunk(
-        self, content: str, role: str = None, finish_reason: str = None
+        self, content: str, role: str = None, finish_reason: str = None, status: Dict[str, Any] = None
     ) -> str:
         """创建流式响应chunk"""
         import json
@@ -3635,7 +3648,12 @@ class GenerationHandler:
         if finish_reason:
             chunk["choices"][0]["delta"]["content"] = content
         else:
-            chunk["choices"][0]["delta"]["reasoning_content"] = content
+            # status line: structured code next to the text; the text can be switched off ([generation] status_text)
+            status = status or status_payload(content)
+            if status:
+                chunk["status"] = status
+            if status is None or config.generation_status_text:
+                chunk["choices"][0]["delta"]["reasoning_content"] = content
 
         return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 

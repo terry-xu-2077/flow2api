@@ -452,6 +452,11 @@ class Config:
         return self._config.get("generation", {}) or {}
 
     @property
+    def generation_status_text(self) -> bool:
+        """流式状态行是否仍附带文字（reasoning_content）；关闭后只发 status 消息代码。"""
+        return bool(self._generation_section().get("status_text", True))
+
+    @property
     def image_max_concurrency(self) -> int:
         """同时进行的图片生成上限（全局）；0 表示不限制。"""
         try:
