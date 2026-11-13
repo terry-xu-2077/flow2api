@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import math
+import random
 import statistics
 import time
 from pathlib import Path
@@ -1452,6 +1453,10 @@ def _resolve_tier_two_model_key(model_key: str) -> str:
     return candidate if candidate in _known_video_model_keys() else model_key
 
 
+# 图片并发里“基础”部分的个数：超出它、占用额外并发额度的任务会先随机延迟再发
+IMAGE_BASE_CONCURRENCY = 2
+
+
 class GenerationHandler:
     """统一生成处理器"""
 
@@ -1791,6 +1796,14 @@ class GenerationHandler:
                     ensure_ascii=False,
                 )
                 return
+            if held and gate.active > IMAGE_BASE_CONCURRENCY:
+                # 前 IMAGE_BASE_CONCURRENCY 个并发直接发；占用额外并发额度的任务随机等 0.5~3 秒再发，
+                # 不排队等前面完成，但也不和前面的任务同一瞬间发出
+                delay = random.uniform(0.5, 3.0)
+                debug_logger.log_info(
+                    f"[GATE] 额外并发额度（当前 {gate.active} 个）随机延迟 {delay:.2f}s"
+                )
+                await asyncio.sleep(delay)
             async for chunk in self._handle_generation_inner(
                 model, prompt, images, stream, base_url_override, video_media_id
             ):
